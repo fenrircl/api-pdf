@@ -76,3 +76,15 @@ IMPLEMENTACION.md
 El repositorio `document-processing-api` ya tiene FastAPI, autenticación Bearer, validación Pydantic, proveedor Gemini/OpenAI con fallback y extracción de boletas/estados de cuenta en `infra/processing/app/workers/extract_worker.py`, `infra/processing/shared/ai_gateway.py` y `infra/processing/shared/ai_schemas.py`. Reutilizar patrones y adaptadores puntuales; evitar importar el worker completo porque trae dependencias de R2, colas, Mongo y lógica específica de estados bancarios. Separar el nuevo esquema comercial del contrato de transacciones bancarias.
 
 Antes de producción: acordar límites de archivo/páginas, proveedor/modelo, campos obligatorios por tipo y comportamiento ante baja confianza; probar con PDFs reales anonimizados y medir latencia/costo.
+
+## Estado de este repositorio
+
+Implementado en la primera versión:
+
+- Extracción de texto embebido con PyMuPDF y OCR local Tesseract (`spa+eng`) para páginas con imágenes o sin texto seleccionable suficiente.
+- Límite de tamaño y páginas, verificación de extensión/MIME/firma PDF, rechazo de PDF cifrado y límite de concurrencia.
+- Estructuración/clasificación por Gemini primero y OpenAI después. Si Gemini falla o una factura queda sin sus campos obligatorios y OpenAI está configurado, se intenta OpenAI.
+- Respuesta con texto completo (`raw_text`), hash, páginas, páginas procesadas por OCR, proveedor/modelo usado, duración, confianza y advertencias.
+- Imagen Docker con Tesseract y modelos de idioma español e inglés; ejecución como usuario no-root.
+
+Pendiente antes de producción: probar calidad con muestras anonimizadas reales; definir los campos y esquemas específicos de cotizaciones, transporte y otros documentos; decidir umbral de confianza y revisión humana; ajustar límites/timeout y concurrencia al hardware de la VM/CT; instalar/desplegar en Proxmox detrás del túnel/proxy con límites de cuerpo y timeout alineados; y añadir pruebas automatizadas y ejemplos de integración n8n. La API no persiste documentos ni tiene actualmente autenticación por consumidor, rate limiting distribuido, métricas, modo asíncrono ni mecanismo de reintento durable. El proveedor LLM recibe el texto OCR enviado para estructuración, por lo que hay que aprobar esa transferencia de datos y configurar sus credenciales antes de habilitarla.
