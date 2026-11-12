@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from typing import Any, Literal
@@ -27,7 +29,9 @@ OCR_MIN_CHARS_PER_PAGE = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "25"))
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "45"))
 OCR_TOTAL_TIMEOUT_SECONDS = int(os.getenv("OCR_TOTAL_TIMEOUT_SECONDS", "180"))
 PROVIDER_TIMEOUT_SECONDS = int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
+API_METRICS_FILE = os.getenv("API_METRICS_FILE", "/tmp/api-pdf-metrics.jsonl")
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2"))))
+METRICS_LOCK = threading.Lock()
 
 
 class ExtractionResponse(BaseModel):
@@ -55,6 +59,38 @@ async def require_bearer(authorization: str | None = Header(default=None)) -> No
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _record_metrics(response: ExtractionResponse) -> None:
+    """Append one metadata-only JSONL record; never persist the extracted text."""
+    raw_text_bytes = response.raw_text.encode("utf-8")
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "request_id": response.request_id,
+        "filename": response.source.get("filename"),
+        "document_type": response.document_type,
+        "pages": response.source.get("pages"),
+        "ocr_pages": response.extraction.get("ocr_pages", 0),
+        "ocr_failures": response.extraction.get("ocr_failures", 0),
+        "extracted_text_chars": len(response.raw_text),
+        "extracted_text_utf8_bytes": len(raw_text_bytes),
+        "provider": response.extraction.get("provider"),
+        "model": response.extraction.get("model"),
+        "duration_ms": response.extraction.get("duration_ms"),
+        "warning_count": len(response.warnings),
+    }
+    try:
+        directory = os.path.dirname(API_METRICS_FILE) or "."
+        os.makedirs(directory, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with METRICS_LOCK, open(API_METRICS_FILE, "a", encoding="utf-8") as metrics_file:
+            metrics_file.write(line)
+            metrics_file.flush()
+    except OSError as exc:
+        logger.warning(
+            "metrics_write_failed request_id=%s error=%s",
+            response.request_id, type(exc).__name__,
+        )
 
 
 def _extract_pdf_text(content: bytes) -> tuple[str, int, int, int]:
@@ -200,4 +236,5 @@ async def extract_document(
         request_id, response.source["sha256"], page_count, ocr_pages,
         provider_name or "none", provider_model or "none",
     )
+    _record_metrics(response)
     return response

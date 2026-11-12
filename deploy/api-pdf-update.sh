@@ -38,6 +38,7 @@ run_api_pdf() {
     --restart unless-stopped \
     --env-file "$ENV_FILE" \
     --env GEMINI_COOLDOWN_FILE=/var/lib/api-pdf/model-cooldowns.json \
+    --env API_METRICS_FILE=/var/lib/api-pdf/metrics.jsonl \
     --mount "type=bind,source=$STATE_DIR,target=/var/lib/api-pdf" \
     --publish "$HOST_PORT:8000" \
     --health-cmd='python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\")"' \
