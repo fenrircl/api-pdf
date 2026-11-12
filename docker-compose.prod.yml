@@ -2,6 +2,10 @@ services:
   api-pdf:
     image: ghcr.io/fenrircl/api-pdf:latest
     env_file: .env
+    environment:
+      GEMINI_CIRCUIT_FILE: /var/lib/api-pdf/gemini-circuit.json
+    volumes:
+      - api-pdf-state:/var/lib/api-pdf
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -10,3 +14,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  api-pdf-state:

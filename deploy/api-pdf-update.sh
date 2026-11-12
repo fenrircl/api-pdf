@@ -38,6 +38,7 @@ run_api_pdf() {
     --restart unless-stopped \
     --env-file "$ENV_FILE" \
     --env GEMINI_COOLDOWN_FILE=/var/lib/api-pdf/model-cooldowns.json \
+    --env GEMINI_CIRCUIT_FILE=/var/lib/api-pdf/gemini-circuit.json \
     --env API_METRICS_FILE=/var/lib/api-pdf/metrics.jsonl \
     --mount "type=bind,source=$STATE_DIR,target=/var/lib/api-pdf" \
     --publish "$HOST_PORT:8000" \

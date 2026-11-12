@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 import logging
@@ -33,8 +34,14 @@ DEFAULT_GEMINI_MODELS = (
 )
 
 logger = logging.getLogger(__name__)
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = max(0.1, float(os.getenv("GEMINI_ATTEMPT_TIMEOUT_SECONDS", "30")))
+GEMINI_FAILURE_COOLDOWN_SECONDS = max(1, int(os.getenv("GEMINI_FAILURE_COOLDOWN_SECONDS", "1800")))
+GEMINI_CIRCUIT_FILE = os.getenv("GEMINI_CIRCUIT_FILE", "/tmp/api-pdf-gemini-circuit.json")
+SUPPORTED_DOCUMENT_TYPES = {"invoice", "receipt", "quote", "transport_document", "other"}
 _COOLDOWN_LOCK = threading.RLock()
 _COOLDOWN_CACHE: dict[str, float] = {}
+_GEMINI_CIRCUIT_LOCK = threading.RLock()
+_GEMINI_CIRCUIT_UNTIL = 0.0
 
 
 def _parse_json(value: str) -> dict[str, Any]:
@@ -182,6 +189,76 @@ def _is_daily_quota_error(exc: Exception) -> bool:
     ))
 
 
+def _gemini_circuit_key() -> str:
+    key_hash = hashlib.sha256(os.getenv("GEMINI_API_KEY", "").encode()).hexdigest()[:12]
+    return f"gemini:{key_hash}"
+
+
+def _read_gemini_circuit_state() -> dict[str, float]:
+    try:
+        with open(GEMINI_CIRCUIT_FILE, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        if isinstance(state, dict):
+            return {key: float(value) for key, value in state.items() if isinstance(value, (int, float))}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning("Could not read Gemini circuit state: %s", type(exc).__name__)
+    return {}
+
+
+def _write_gemini_circuit_state(state: dict[str, float]) -> None:
+    temp_name: str | None = None
+    try:
+        directory = os.path.dirname(GEMINI_CIRCUIT_FILE) or "."
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False) as state_file:
+            json.dump(state, state_file)
+            temp_name = state_file.name
+        os.replace(temp_name, GEMINI_CIRCUIT_FILE)
+    except OSError as exc:
+        logger.warning("Could not persist Gemini circuit state: %s", type(exc).__name__)
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+
+
+def _gemini_circuit_remaining() -> int:
+    now = time.time()
+    with _GEMINI_CIRCUIT_LOCK:
+        expiry = max(_GEMINI_CIRCUIT_UNTIL, _read_gemini_circuit_state().get(_gemini_circuit_key(), 0))
+    return max(0, int(expiry - now))
+
+
+def _open_gemini_circuit(reason: str) -> None:
+    global _GEMINI_CIRCUIT_UNTIL
+    expiry = time.time() + GEMINI_FAILURE_COOLDOWN_SECONDS
+    with _GEMINI_CIRCUIT_LOCK:
+        _GEMINI_CIRCUIT_UNTIL = expiry
+        state = _read_gemini_circuit_state()
+        state[_gemini_circuit_key()] = expiry
+        _write_gemini_circuit_state(state)
+    logger.warning(
+        "Gemini circuit opened cooldown_seconds=%d reason=%s",
+        GEMINI_FAILURE_COOLDOWN_SECONDS, reason,
+    )
+
+
+def _close_gemini_circuit() -> None:
+    global _GEMINI_CIRCUIT_UNTIL
+    with _GEMINI_CIRCUIT_LOCK:
+        _GEMINI_CIRCUIT_UNTIL = 0.0
+        state = _read_gemini_circuit_state()
+        state.pop(_gemini_circuit_key(), None)
+        _write_gemini_circuit_state(state)
+
+
+def _has_supported_document_type(result: dict[str, Any]) -> bool:
+    return result.get("document_type") in SUPPORTED_DOCUMENT_TYPES
+
+
 def _models_not_in_cooldown(models: list[str]) -> list[str]:
     cooldowns = _load_model_cooldowns()
     now = time.time()
@@ -234,44 +311,66 @@ def _should_try_next_model(exc: Exception) -> bool:
 async def extract_with_provider(
     text: str, *, document_type: str, locale: str
 ) -> tuple[dict[str, Any], str | None, str | None]:
-    """Try Gemini first and OpenAI second; OCR has already run locally."""
+    """Prefer Gemini; open a persistent 30-minute circuit after any Gemini failure."""
     if not text.strip():
-        return {}, None, None
+        raise RuntimeError("No text was extracted from the PDF")
     prompt = EXTRACTION_PROMPT.format(
         locale=locale[:32], document_type=document_type,
         text=text[: int(os.getenv("MAX_PROVIDER_TEXT_CHARS", "100000"))],
     )
     errors: list[str] = []
+    first_result: dict[str, Any] | None = None
+    first_model: str | None = None
+    loop = asyncio.get_running_loop()
+    provider_started = loop.time()
+    provider_timeout = max(1.0, float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60")))
+
     if os.getenv("GEMINI_API_KEY"):
-        first_result: dict[str, Any] | None = None
-        first_model: str | None = None
-        configured_models = _gemini_models()
-        available_models = _models_not_in_cooldown(configured_models)
-        if configured_models and not available_models:
-            errors.append("gemini:all_models_in_daily_quota_cooldown")
-        for model in available_models:
-            try:
-                result = await _gemini_extract(prompt, model)
-                if first_result is None:
-                    first_result = result
-                    first_model = model
-                if not _invoice_incomplete(result, document_type):
+        circuit_remaining = _gemini_circuit_remaining()
+        if circuit_remaining:
+            logger.info("Gemini circuit open; using OpenAI fallback retry_in_seconds=%d", circuit_remaining)
+            if not os.getenv("OPENAI_API_KEY"):
+                errors.append("gemini_circuit_open_without_openai")
+        else:
+            models = _models_not_in_cooldown(_gemini_models())
+            if not models:
+                errors.append("gemini:no_available_models")
+                _open_gemini_circuit("no_available_models")
+            else:
+                model = models[0]
+                try:
+                    result = await asyncio.wait_for(
+                        _gemini_extract(prompt, model),
+                        timeout=min(GEMINI_ATTEMPT_TIMEOUT_SECONDS, max(0.1, provider_timeout - 1)),
+                    )
+                    if not _has_supported_document_type(result):
+                        raise RuntimeError("Gemini returned an unclassified document")
+                    if _invoice_incomplete(result, document_type):
+                        first_result, first_model = result, model
+                        raise RuntimeError("Gemini returned incomplete invoice fields")
+                    _close_gemini_circuit()
                     return result, "gemini", model
-                errors.append(f"{model}:invoice_fields_incomplete")
-            except Exception as exc:
-                errors.append(f"{model}:{type(exc).__name__}")
-                if _is_daily_quota_error(exc):
-                    _cool_down_model_for_daily_quota(model)
-                if not _should_try_next_model(exc):
-                    break
-        if first_result is not None and not os.getenv("OPENAI_API_KEY"):
-            return first_result, "gemini", first_model
+                except Exception as exc:
+                    errors.append(f"gemini:{type(exc).__name__}")
+                    if _is_daily_quota_error(exc):
+                        _cool_down_model_for_daily_quota(model)
+                    _open_gemini_circuit(type(exc).__name__)
+
     if os.getenv("OPENAI_API_KEY"):
-        try:
-            result, model = await _openai_extract(prompt)
-            return result, "openai", model
-        except Exception as exc:
-            errors.append(f"openai:{type(exc).__name__}")
-    if errors:
-        raise RuntimeError("All configured extraction providers failed: " + ",".join(errors))
-    return {}, None, None
+        remaining = provider_timeout - (loop.time() - provider_started) - 0.5
+        if remaining > 0:
+            try:
+                result, model = await asyncio.wait_for(_openai_extract(prompt), timeout=remaining)
+                if not _has_supported_document_type(result):
+                    raise RuntimeError("OpenAI returned an unclassified document")
+                return result, "openai", model
+            except Exception as exc:
+                errors.append(f"openai:{type(exc).__name__}")
+        else:
+            errors.append("openai:no_time_remaining")
+
+    if first_result is not None:
+        return first_result, "gemini", first_model
+    if not os.getenv("GEMINI_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+        errors.append("no_provider_configured")
+    raise RuntimeError("No provider could classify the document: " + ",".join(errors))

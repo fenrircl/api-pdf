@@ -184,7 +184,7 @@ async def extract_document(
         raw_text, page_count, ocr_pages, ocr_failures = await asyncio.to_thread(_extract_pdf_text, content)
         warnings: list[str] = []
         if not raw_text.strip():
-            warnings.append("No se pudo extraer texto del PDF.")
+            raise HTTPException(422, "No se pudo extraer texto del PDF; revisa el archivo y vuelve a intentarlo.")
         if ocr_failures:
             warnings.append(f"OCR falló en {ocr_failures} página(s); revisar la extracción.")
         if len(raw_text) > int(os.getenv("MAX_PROVIDER_TEXT_CHARS", "100000")):
@@ -197,17 +197,22 @@ async def extract_document(
                 extract_with_provider(raw_text, document_type=document_type, locale=locale),
                 timeout=PROVIDER_TIMEOUT_SECONDS,
             )
-            if raw_text.strip() and not provider_name:
-                warnings.append("No hay proveedor Gemini u OpenAI configurado; se devuelve el texto sin estructurar.")
         except Exception as exc:
             logger.warning("Provider extraction failed request_id=%s error=%s", request_id, type(exc).__name__)
-            warnings.append("No fue posible estructurar el documento con los proveedores configurados.")
+            raise HTTPException(
+                status_code=503,
+                detail="No se pudo procesar el documento con los modelos disponibles. Reintenta la solicitud.",
+                headers={"Retry-After": "10"},
+            ) from exc
 
-    kind = result.get("document_type", "unknown")
-    if kind not in {"invoice", "quote", "transport_document", "other", "unknown"}:
-        kind = "unknown"
-    if document_type != "auto" and kind == "unknown":
-        kind = document_type
+    kind = result.get("document_type")
+    if kind not in {"invoice", "receipt", "quote", "transport_document", "other"}:
+        logger.error("Provider returned unsupported classification request_id=%s type=%s", request_id, kind)
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo clasificar el documento con los modelos disponibles. Reintenta la solicitud.",
+            headers={"Retry-After": "10"},
+        )
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     if kind == "invoice":
         required = {
