@@ -14,15 +14,17 @@ Texto del PDF:
 """
 
 DEFAULT_GEMINI_MODELS = (
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3-flash-preview",
+    # Known models that were temporarily overloaded or unavailable to this key
+    # go last so a transient failure does not delay the common path.
     "gemini-3.8-flash",
     "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
 )
 
 
@@ -57,14 +59,20 @@ async def _openai_extract(prompt: str) -> tuple[dict[str, Any], str]:
 
     client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60")))
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    request_options: dict[str, Any] = {}
+    if model.startswith("gpt-6-luna"):
+        # GPT-6 reasoning models reject temperature when reasoning_effort is set.
+        request_options["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT", "medium")
+    else:
+        request_options["temperature"] = 0
     response = await client.chat.completions.create(
         model=model,
-        temperature=0,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": "Extrae datos de documentos sin inventar información. Responde únicamente JSON."},
             {"role": "user", "content": prompt},
         ],
+        **request_options,
     )
     return _parse_json(response.choices[0].message.content or ""), model
 
@@ -103,11 +111,11 @@ def _should_try_next_model(exc: Exception) -> bool:
             error = response_json.get("error", {})
             if isinstance(error, dict):
                 code = error.get("code")
-    if isinstance(code, int) and code in {400, 401, 402, 403}:
+    if isinstance(code, int) and code in {401, 402}:
         return False
     message = str(exc).lower()
     if any(marker in message for marker in (
-        "prepayment credits are depleted", "payment required", "unauthorized", "permission denied",
+        "prepayment credits are depleted", "payment required", "unauthorized",
     )):
         return False
     return True
