@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll GHCR for api-pdf updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=api-pdf-update.service
+
+[Install]
+WantedBy=timers.target

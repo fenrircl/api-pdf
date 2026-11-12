@@ -16,23 +16,34 @@ Endpoint: `POST /v1/extractions`, multipart con `file` y campos `document_type` 
 
 Límites configurables: `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_CONCURRENT_EXTRACTIONS`, `OCR_LANG`, `OCR_TIMEOUT_SECONDS`, `OCR_TOTAL_TIMEOUT_SECONDS`, `PROVIDER_TIMEOUT_SECONDS` y `MAX_PROVIDER_TEXT_CHARS`. Para OCR en español e inglés, la imagen base instala los paquetes Tesseract correspondientes.
 
-## Despliegue en VM con Docker Compose
+## Despliegue automático en VM
 
-Instala Docker Engine con el plugin Compose en la VM. Si el paquete GHCR es privado, autentícate con un PAT que tenga `read:packages`:
+El workflow de GitHub Actions construye y publica la imagen `latest` en cada push a `master`. En la VM, un timer de systemd comprueba GHCR cada cinco minutos, actualiza el contenedor solo cuando cambia la imagen y lo revierte a la imagen anterior si falla el healthcheck. No requiere Docker Compose. La configuración de la VM se hace una sola vez; luego basta hacer `git push` para desplegar.
+
+Primero, sube estos archivos al repositorio GitHub para activar el workflow. En una VM Debian/Ubuntu con Docker instalado, instala Git y clona el repo:
 
 ```sh
-docker login ghcr.io -u fenrircl
+sudo apt-get update
+sudo apt-get install -y git
+git clone https://github.com/fenrircl/api-pdf.git
+cd api-pdf
+```
+
+Luego configura el entorno e instala el timer:
+
+```sh
 cp .env.example .env
 nano .env
-docker compose -f docker-compose.prod.yml pull
-docker compose -f docker-compose.prod.yml up -d
+sudo mkdir -p /etc/api-pdf
+sudo install -m 600 .env /etc/api-pdf/api-pdf.env
+sudo docker login ghcr.io -u fenrircl
+sudo install -m 755 deploy/api-pdf-update.sh /usr/local/sbin/api-pdf-update
+sudo install -m 644 deploy/api-pdf-update.service deploy/api-pdf-update.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now api-pdf-update.timer
+sudo systemctl start api-pdf-update.service
 ```
 
-En `.env`, configura `API_BEARER_TOKEN` y `GEMINI_API_KEY` y/o `OPENAI_API_KEY`. La imagen de despliegue se publica en GHCR. Para actualizar la aplicación sin reemplazar la VM:
+El PAT solicitado por `docker login` necesita `read:packages`. En `.env`, configura `API_BEARER_TOKEN` y `GEMINI_API_KEY` y/o `OPENAI_API_KEY`; no subas `.env` a GitHub. Después de esta configuración, cada push a `master` publica la imagen y la VM la instala automáticamente en un máximo aproximado de cinco minutos. El workflow construye `linux/amd64`, adecuado para una VM x86_64. Para ver el resultado, usa `sudo journalctl -u api-pdf-update.service`.
 
-```sh
-docker compose -f docker-compose.prod.yml pull
-docker compose -f docker-compose.prod.yml up -d
-```
-
-Comprueba el servicio con `curl http://127.0.0.1:8000/health`. El archivo de despliegue publica el puerto 8000 en la interfaz de red de la VM; permite el acceso solo desde los consumidores o el proxy que deban usar la API.
+Comprueba el servicio con `curl http://127.0.0.1:8000/health`. El contenedor publica el puerto 8000 en las interfaces de la VM; permite el acceso solo desde los consumidores o el proxy que deban usar la API.
