@@ -7,6 +7,7 @@ ENV_FILE="/etc/api-pdf/api-pdf.env"
 STATE_DIR="/var/lib/api-pdf"
 HOST_PORT="8000"
 LOCK_FILE="/run/lock/api-pdf-update.lock"
+ENV_HASH_FILE="$STATE_DIR/.env-sha256"
 
 if [[ ! -r "$ENV_FILE" ]]; then
   echo "Missing environment file: $ENV_FILE" >&2
@@ -23,11 +24,13 @@ fi
 
 OLD_IMAGE="$(docker inspect "$CONTAINER" --format '{{.Image}}' 2>/dev/null || true)"
 OLD_HEALTHCHECK="$(docker inspect "$CONTAINER" --format '{{if .Config.Healthcheck}}yes{{else}}no{{end}}' 2>/dev/null || true)"
+ENV_HASH="$(sha256sum "$ENV_FILE" | cut -d ' ' -f1)"
+OLD_ENV_HASH="$(cat "$ENV_HASH_FILE" 2>/dev/null || true)"
 docker pull "$IMAGE"
 NEW_IMAGE="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
 
-if [[ -n "$OLD_IMAGE" && "$OLD_IMAGE" == "$NEW_IMAGE" && "$OLD_HEALTHCHECK" == "yes" ]]; then
-  echo "api-pdf is already current ($NEW_IMAGE)"
+if [[ -n "$OLD_IMAGE" && "$OLD_IMAGE" == "$NEW_IMAGE" && "$OLD_HEALTHCHECK" == "yes" && "$OLD_ENV_HASH" == "$ENV_HASH" ]]; then
+  echo "api-pdf is already current ($NEW_IMAGE; environment unchanged)"
   exit 0
 fi
 
@@ -59,6 +62,9 @@ fi
 for _ in $(seq 1 30); do
   STATUS="$(docker inspect "$CONTAINER" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' 2>/dev/null || true)"
   if [[ "$STATUS" == "healthy" ]]; then
+    printf '%s\n' "$ENV_HASH" > "$ENV_HASH_FILE.tmp"
+    chmod 600 "$ENV_HASH_FILE.tmp"
+    mv "$ENV_HASH_FILE.tmp" "$ENV_HASH_FILE"
     echo "api-pdf updated successfully to $NEW_IMAGE"
     exit 0
   fi

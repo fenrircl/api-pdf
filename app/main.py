@@ -102,6 +102,16 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+logger.info(
+    "qstash_configuration enabled=%s queue=%s worker_url_configured=%s",
+    bool(
+        QSTASH_TOKEN and QSTASH_WORKER_URL
+        and os.getenv("QSTASH_CURRENT_SIGNING_KEY")
+        and os.getenv("QSTASH_NEXT_SIGNING_KEY")
+    ), QSTASH_QUEUE_NAME, bool(QSTASH_WORKER_URL),
+)
+
+
 def _record_metrics(response: ExtractionResponse) -> None:
     """Append one metadata-only JSONL record; never persist the extracted text."""
     raw_text_bytes = response.raw_text.encode("utf-8")
@@ -266,13 +276,17 @@ def _enqueue_job(job_id: str) -> None:
     from qstash import QStash
 
     client = QStash(QSTASH_TOKEN, base_url=os.getenv("QSTASH_URL") or None)
-    client.message.enqueue_json(
+    published = client.message.enqueue_json(
         queue=QSTASH_QUEUE_NAME,
         url=QSTASH_WORKER_URL,
         body={"job_id": job_id},
         retries=int(os.getenv("QSTASH_RETRIES", "3")),
         timeout=os.getenv("QSTASH_DELIVERY_TIMEOUT", "300s"),
         failure_callback=QSTASH_FAILURE_CALLBACK_URL,
+    )
+    logger.info(
+        "qstash_job_enqueued job_id=%s message_id=%s queue=%s",
+        job_id, getattr(published, "message_id", "unknown"), QSTASH_QUEUE_NAME,
     )
 
 
@@ -329,6 +343,7 @@ async def process_queued_extraction(request: Request) -> dict[str, str]:
         return {"status": "missing"}
     if job["status"] == "completed":
         return {"status": "completed"}
+    logger.info("qstash_job_received job_id=%s", job_id)
     await asyncio.to_thread(jobs.set_job_status, job_id, "processing")
     try:
         response = await _process_extraction(
