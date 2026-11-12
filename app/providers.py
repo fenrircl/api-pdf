@@ -13,6 +13,18 @@ Texto del PDF:
 {text}
 """
 
+DEFAULT_GEMINI_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+)
+
 
 def _parse_json(value: str) -> dict[str, Any]:
     value = value.strip()
@@ -23,18 +35,17 @@ def _parse_json(value: str) -> dict[str, Any]:
     return result
 
 
-async def _gemini_extract(prompt: str) -> tuple[dict[str, Any], str]:
+async def _gemini_extract(prompt: str, model: str) -> dict[str, Any]:
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     response = await client.aio.models.generate_content(
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
     )
-    return _parse_json(response.text or ""), model
+    return _parse_json(response.text or "")
 
 
 async def _openai_extract(prompt: str) -> tuple[dict[str, Any], str]:
@@ -64,6 +75,40 @@ def _invoice_incomplete(result: dict[str, Any], requested_type: str) -> bool:
     return any(data.get(key) in (None, "") for key in required)
 
 
+def _gemini_models() -> list[str]:
+    configured = os.getenv("GEMINI_MODELS", "")
+    if configured.strip():
+        candidates = [model.strip() for model in configured.split(",") if model.strip()]
+    else:
+        candidates = list(DEFAULT_GEMINI_MODELS)
+        # Keep a legacy custom model available after the recommended model chain.
+        legacy_model = os.getenv("GEMINI_MODEL", "").strip()
+        if legacy_model:
+            candidates.append(legacy_model)
+    return list(dict.fromkeys(candidates))
+
+
+def _should_try_next_model(exc: Exception) -> bool:
+    """Fail over for model/quota/transient errors, but not account-wide failures."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, str) and code.isdigit():
+        code = int(code)
+    if not isinstance(code, int):
+        response_json = getattr(exc, "response_json", None)
+        if isinstance(response_json, dict):
+            error = response_json.get("error", {})
+            if isinstance(error, dict):
+                code = error.get("code")
+    if isinstance(code, int) and code in {400, 401, 402, 403}:
+        return False
+    message = str(exc).lower()
+    if any(marker in message for marker in (
+        "prepayment credits are depleted", "payment required", "unauthorized", "permission denied",
+    )):
+        return False
+    return True
+
+
 async def extract_with_provider(
     text: str, *, document_type: str, locale: str
 ) -> tuple[dict[str, Any], str | None, str | None]:
@@ -76,13 +121,23 @@ async def extract_with_provider(
     )
     errors: list[str] = []
     if os.getenv("GEMINI_API_KEY"):
-        try:
-            result, model = await _gemini_extract(prompt)
-            if not _invoice_incomplete(result, document_type) or not os.getenv("OPENAI_API_KEY"):
-                return result, "gemini", model
-            errors.append("gemini:invoice_fields_incomplete")
-        except Exception as exc:
-            errors.append(f"gemini:{type(exc).__name__}")
+        first_result: dict[str, Any] | None = None
+        first_model: str | None = None
+        for model in _gemini_models():
+            try:
+                result = await _gemini_extract(prompt, model)
+                if first_result is None:
+                    first_result = result
+                    first_model = model
+                if not _invoice_incomplete(result, document_type):
+                    return result, "gemini", model
+                errors.append(f"{model}:invoice_fields_incomplete")
+            except Exception as exc:
+                errors.append(f"{model}:{type(exc).__name__}")
+                if not _should_try_next_model(exc):
+                    break
+        if first_result is not None and not os.getenv("OPENAI_API_KEY"):
+            return first_result, "gemini", first_model
     if os.getenv("OPENAI_API_KEY"):
         try:
             result, model = await _openai_extract(prompt)

@@ -83,7 +83,7 @@ Implementado en la primera versión:
 
 - Extracción de texto embebido con PyMuPDF y OCR local Tesseract (`spa+eng`) para páginas con imágenes o sin texto seleccionable suficiente.
 - Límite de tamaño y páginas, verificación de extensión/MIME/firma PDF, rechazo de PDF cifrado y límite de concurrencia.
-- Estructuración/clasificación por Gemini primero y OpenAI después. Si Gemini falla o una factura queda sin sus campos obligatorios y OpenAI está configurado, se intenta OpenAI.
+- Estructuración/clasificación por la lista `GEMINI_MODELS` en orden; se cambia de modelo ante límite de cuota, modelo no disponible, error transitorio o campos de factura incompletos. Si todos fallan y OpenAI está configurado, se intenta OpenAI.
 - Respuesta con texto completo (`raw_text`), hash, páginas, páginas procesadas por OCR, proveedor/modelo usado, duración, confianza y advertencias.
 - Imagen Docker con Tesseract y modelos de idioma español e inglés; ejecución como usuario no-root.
 

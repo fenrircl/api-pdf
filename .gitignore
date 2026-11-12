@@ -1,2 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
 test_pdf/*
 !test_pdf/README.md
