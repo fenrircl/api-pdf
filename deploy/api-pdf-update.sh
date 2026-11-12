@@ -4,6 +4,7 @@ set -Eeuo pipefail
 IMAGE="ghcr.io/fenrircl/api-pdf:latest"
 CONTAINER="api-pdf"
 ENV_FILE="/etc/api-pdf/api-pdf.env"
+STATE_DIR="/var/lib/api-pdf"
 HOST_PORT="8000"
 LOCK_FILE="/run/lock/api-pdf-update.lock"
 
@@ -11,6 +12,8 @@ if [[ ! -r "$ENV_FILE" ]]; then
   echo "Missing environment file: $ENV_FILE" >&2
   exit 1
 fi
+
+install -d -o 10001 -g 10001 -m 750 "$STATE_DIR"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -34,6 +37,8 @@ run_api_pdf() {
     --name "$CONTAINER" \
     --restart unless-stopped \
     --env-file "$ENV_FILE" \
+    --env GEMINI_COOLDOWN_FILE=/var/lib/api-pdf/model-cooldowns.json \
+    --mount "type=bind,source=$STATE_DIR,target=/var/lib/api-pdf" \
     --publish "$HOST_PORT:8000" \
     --health-cmd='python -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/health\")"' \
     --health-interval=15s \

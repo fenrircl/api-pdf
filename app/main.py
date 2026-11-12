@@ -195,5 +195,9 @@ async def extract_document(
             "duration_ms": round((asyncio.get_running_loop().time() - started) * 1000),
         },
     )
-    logger.info("extraction_complete request_id=%s sha256=%s pages=%s ocr_pages=%s", request_id, response.source["sha256"], page_count, ocr_pages)
+    logger.info(
+        "extraction_complete request_id=%s sha256=%s pages=%s ocr_pages=%s provider=%s model=%s",
+        request_id, response.source["sha256"], page_count, ocr_pages,
+        provider_name or "none", provider_model or "none",
+    )
     return response

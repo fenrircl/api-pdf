@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import os
 import re
+import tempfile
+import threading
+import time
 from typing import Any
 
 
@@ -26,6 +31,10 @@ DEFAULT_GEMINI_MODELS = (
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 )
+
+logger = logging.getLogger(__name__)
+_COOLDOWN_LOCK = threading.RLock()
+_COOLDOWN_CACHE: dict[str, float] = {}
 
 
 def _parse_json(value: str) -> dict[str, Any]:
@@ -100,6 +109,107 @@ def _gemini_models() -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _cooldown_path() -> str:
+    return os.getenv("GEMINI_COOLDOWN_FILE", "/tmp/api-pdf-model-cooldowns.json")
+
+
+def _cooldown_key(model: str) -> str:
+    key_hash = hashlib.sha256(os.getenv("GEMINI_API_KEY", "").encode()).hexdigest()[:12]
+    return f"{key_hash}:{model}"
+
+
+def _load_model_cooldowns() -> dict[str, float]:
+    global _COOLDOWN_CACHE
+    now = time.time()
+    with _COOLDOWN_LOCK:
+        active = {key: expiry for key, expiry in _COOLDOWN_CACHE.items() if expiry > now}
+        try:
+            with open(_cooldown_path(), encoding="utf-8") as cooldown_file:
+                stored = json.load(cooldown_file)
+            if isinstance(stored, dict):
+                for key, expiry in stored.items():
+                    if isinstance(expiry, (int, float)) and expiry > now:
+                        active[key] = float(expiry)
+        except FileNotFoundError:
+            pass
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read Gemini cooldown state: %s", type(exc).__name__)
+        _COOLDOWN_CACHE = active
+        return dict(active)
+
+
+def _save_model_cooldowns(cooldowns: dict[str, float]) -> None:
+    global _COOLDOWN_CACHE
+    with _COOLDOWN_LOCK:
+        _COOLDOWN_CACHE = dict(cooldowns)
+        target = _cooldown_path()
+        temp_name: str | None = None
+        try:
+            directory = os.path.dirname(target) or "."
+            os.makedirs(directory, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=directory, delete=False
+            ) as temp_file:
+                json.dump(cooldowns, temp_file)
+                temp_name = temp_file.name
+            os.replace(temp_name, target)
+        except OSError as exc:
+            logger.warning("Could not persist Gemini cooldown state: %s", type(exc).__name__)
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """Only persist cooldowns when the provider identifies a daily quota limit."""
+    details = getattr(exc, "response_json", None)
+    message = str(exc).lower()
+    if details is not None:
+        try:
+            message += " " + json.dumps(details).lower()
+        except (TypeError, ValueError):
+            pass
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, str) and code.isdigit():
+        code = int(code)
+    if code is not None and code != 429 and "429" not in message:
+        return False
+    compact = re.sub(r"[\s_-]+", "", message)
+    return any(marker in compact for marker in (
+        "perday", "dailyquota", "dailylimit", "requests/day", "requestperday",
+    ))
+
+
+def _models_not_in_cooldown(models: list[str]) -> list[str]:
+    cooldowns = _load_model_cooldowns()
+    now = time.time()
+    available: list[str] = []
+    for model in models:
+        expiry = cooldowns.get(_cooldown_key(model))
+        if expiry and expiry > now:
+            logger.info(
+                "Skipping Gemini model in daily quota cooldown model=%s retry_in_seconds=%d",
+                model, max(1, int(expiry - now)),
+            )
+        else:
+            available.append(model)
+    return available
+
+
+def _cool_down_model_for_daily_quota(model: str) -> None:
+    cooldown_seconds = max(60, int(os.getenv("GEMINI_DAILY_QUOTA_COOLDOWN_SECONDS", "86400")))
+    cooldowns = _load_model_cooldowns()
+    expiry = time.time() + cooldown_seconds
+    cooldowns[_cooldown_key(model)] = expiry
+    _save_model_cooldowns(cooldowns)
+    logger.warning(
+        "Gemini daily quota reached; cooling down model=%s cooldown_seconds=%d",
+        model, cooldown_seconds,
+    )
+
+
 def _should_try_next_model(exc: Exception) -> bool:
     """Fail over for model/quota/transient errors, but not account-wide failures."""
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
@@ -135,7 +245,11 @@ async def extract_with_provider(
     if os.getenv("GEMINI_API_KEY"):
         first_result: dict[str, Any] | None = None
         first_model: str | None = None
-        for model in _gemini_models():
+        configured_models = _gemini_models()
+        available_models = _models_not_in_cooldown(configured_models)
+        if configured_models and not available_models:
+            errors.append("gemini:all_models_in_daily_quota_cooldown")
+        for model in available_models:
             try:
                 result = await _gemini_extract(prompt, model)
                 if first_result is None:
@@ -146,6 +260,8 @@ async def extract_with_provider(
                 errors.append(f"{model}:invoice_fields_incomplete")
             except Exception as exc:
                 errors.append(f"{model}:{type(exc).__name__}")
+                if _is_daily_quota_error(exc):
+                    _cool_down_model_for_daily_quota(model)
                 if not _should_try_next_model(exc):
                     break
         if first_result is not None and not os.getenv("OPENAI_API_KEY"):
