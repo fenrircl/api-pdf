@@ -40,10 +40,14 @@ async def _gemini_extract(prompt: str, model: str) -> dict[str, Any]:
     from google.genai import types
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    config_options: dict[str, Any] = {"response_mime_type": "application/json"}
+    model_major = re.match(r"^gemini-(\d+)", model)
+    if not model_major or int(model_major.group(1)) < 3:
+        config_options["temperature"] = 0
     response = await client.aio.models.generate_content(
         model=model,
         contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
+        config=types.GenerateContentConfig(**config_options),
     )
     return _parse_json(response.text or "")
 
