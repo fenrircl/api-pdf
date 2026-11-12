@@ -13,7 +13,9 @@ Servicio independiente para que n8n u otros sistemas envíen un documento y reci
 | `file` | PDF o imagen permitida; validar extensión, MIME, firma y tamaño máximo |
 | `document_type` | `auto`, `invoice`, `quote`, `transport_document` |
 | `locale` | Idioma/país, por defecto `es-CL` |
-| `include_raw_text` | Opcional; desactivado por defecto |
+| `wait` | `true` (por defecto) espera hasta `JOB_WAIT_SECONDS` y devuelve el resultado o `202`; `false` devuelve `202` inmediatamente con `job_id` |
+
+`GET /v1/extractions/{job_id}` requiere el mismo bearer y devuelve el estado (`queued`, `processing`, `completed`, `failed`) y el resultado cuando está disponible. El consumidor debe consultar hasta `completed` o `failed`; al completar, el objeto de extracción está en `result`. Los jobs se guardan en SQLite en el volumen persistente; QStash hace entrega durable, reintentos y callback final de fallos. Si no hay credenciales QStash, se mantiene el modo síncrono y `wait=false` responde `503`.
 
 La respuesta debe incluir `document_type`, `document_subtype`, `data`, `confidence`, `warnings`, `source` (nombre, MIME, SHA-256, páginas) y `schema_version`. No afirmar que una extracción está confirmada: los valores no legibles van como `null`, y los warnings explican ambigüedades.
 
@@ -25,7 +27,7 @@ Errores HTTP: `400` formato/tipo no soportado, `401` token ausente/inválido, `4
 
 1. FastAPI valida bearer, tamaño, MIME/firma y cantidad de páginas antes del procesamiento.
 2. El adaptador crea un extractor por tipo de documento. La lógica de proveedores queda detrás de una interfaz `extract(file_bytes, schema, locale)`.
-3. Empezar con respuesta síncrona para documentos individuales, límites estrictos de tamaño/páginas y timeout. Si un documento excede el tiempo HTTP o hay lotes grandes, añadir modo asíncrono `202 + job_id` y polling; no cargar Redis/Mongo al MVP sin necesitarlo.
+3. Procesar en modo síncrono o, con QStash configurado, encolar cada documento; persistir el PDF pendiente y el resultado/status en SQLite montado en volumen. Consultar con polling usando `job_id`.
 4. Validar la salida con Pydantic; normalizar fechas ISO `YYYY-MM-DD`, moneda/códigos y RUT sin inventar valores. Incluir proveedor/modelo y duración en metadata operativa, sin registrar texto sensible.
 5. No conectar con R2 ni con BD de Acerosera/Transportes. n8n sube el original a R2, busca/crea o actualiza la factura según reglas del proyecto y guarda la URL/clave del objeto junto a los datos extraídos.
 
@@ -33,7 +35,7 @@ Errores HTTP: `400` formato/tipo no soportado, `401` token ausente/inválido, `4
 
 ### Acerosera
 
-Leer carpeta (cotizaciones, facturas proveedor y cliente) → enviar archivo a `/v1/extractions` con `document_type=auto` → revisar tipo y campos clave → subir binario a R2 → localizar factura por tipo DTE, RUT emisor, folio y fecha → insertar o actualizar la factura existente sin datos, agregando clave/URL R2 → mover el archivo o registrar resultado. Aplicar idempotencia con hash SHA-256 y no sobrescribir datos confirmados con valores vacíos.
+Leer carpeta (cotizaciones, facturas proveedor y cliente) → enviar archivo a `/v1/extractions` con `document_type=auto` y `wait=false` → consultar `GET /v1/extractions/{job_id}` hasta `completed` (o gestionar `failed`) → revisar tipo y campos clave → subir binario a R2 → localizar factura por tipo DTE, RUT emisor, folio y fecha → insertar o actualizar la factura existente sin datos, agregando clave/URL R2 → mover el archivo o registrar resultado. Aplicar idempotencia con hash SHA-256 y no sobrescribir datos confirmados con valores vacíos.
 
 ### Transportes / Google Drive
 
@@ -45,7 +47,7 @@ La clasificación automática puede equivocarse: definir umbral de confianza con
 
 - Bearer secreto en variable de entorno/secret store; nunca en el repositorio. Comparación en tiempo constante, rotación y tokens separados por consumidor cuando haya más de un proyecto.
 - Limitar tamaño, páginas, concurrencia, duración y tasa. Validar contenido real, nombres seguros y rechazar archivos comprimidos/formatos no soportados.
-- No persistir documentos ni secretos de proveedores. Borrar buffers temporales al terminar; logs solo con request ID, hash, tamaño, clasificación y latencia.
+- Persistir temporalmente el PDF pendiente en el volumen local para que la cola no dependa de la memoria del proceso; borrar ese contenido al completar/fallar. Restringir acceso al volumen, proteger secretos QStash y mantener logs sin texto sensible.
 - Ejecutar contenedor no-root detrás de Cloudflare Tunnel en un subdominio, sin publicar el puerto de origen. El túnel cifra el acceso de borde al origen; mantener bearer requerido también en el origen.
 - Healthcheck sin información sensible. HTTPS público por Cloudflare, límites de carga/timeout coherentes en proxy y API.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
@@ -15,9 +16,11 @@ import uuid
 from typing import Any, Literal
 
 import fitz
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
 
+from app import jobs
 from app.providers import extract_with_provider
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -35,6 +38,14 @@ EXTRACTION_QUEUE_TIMEOUT_SECONDS = max(0.1, float(os.getenv("EXTRACTION_QUEUE_TI
 API_METRICS_FILE = os.getenv("API_METRICS_FILE", "/tmp/api-pdf-metrics.jsonl")
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2"))))
 METRICS_LOCK = threading.Lock()
+QSTASH_TOKEN = os.getenv("QSTASH_TOKEN", "")
+QSTASH_QUEUE_NAME = os.getenv("QSTASH_QUEUE_NAME", "api-pdf-extractions")
+QSTASH_WORKER_URL = os.getenv("QSTASH_WORKER_URL", "")
+QSTASH_FAILURE_CALLBACK_URL = os.getenv(
+    "QSTASH_FAILURE_CALLBACK_URL",
+    QSTASH_WORKER_URL.rsplit("/", 1)[0] + "/failures" if QSTASH_WORKER_URL else "",
+)
+JOB_WAIT_SECONDS = max(0, float(os.getenv("JOB_WAIT_SECONDS", "25")))
 
 
 @asynccontextmanager
@@ -67,6 +78,14 @@ class ExtractionResponse(BaseModel):
     source: dict[str, Any]
     schema_version: str = "1.0"
     extraction: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExtractionJobResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "processing", "completed", "failed"]
+    status_url: str
+    result: ExtractionResponse | None = None
+    error: str | None = None
 
 
 async def require_bearer(authorization: str | None = Header(default=None)) -> None:
@@ -194,13 +213,14 @@ def _extract_pdf_text(content: bytes) -> tuple[str, int, int, int]:
     return "\n\n".join(pages), page_count, ocr_pages, ocr_failures
 
 
-@app.post("/v1/extractions", response_model=ExtractionResponse)
+@app.post("/v1/extractions")
 async def extract_document(
     _: None = Depends(require_bearer),
     file: UploadFile = File(...),
     document_type: Literal["auto", "invoice", "quote", "transport_document"] = Form("auto"),
     locale: str = Form("es-CL"),
-) -> ExtractionResponse:
+    wait: bool = Form(True),
+) -> Any:
     request_id = str(uuid.uuid4())
     content = await file.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
@@ -212,6 +232,161 @@ async def extract_document(
         raise HTTPException(415, "File must have a .pdf extension")
     if file.content_type not in (None, "", "application/pdf", "application/octet-stream"):
         raise HTTPException(415, "Content-Type must be application/pdf")
+
+    qstash_requested = any((QSTASH_TOKEN, QSTASH_WORKER_URL, os.getenv("QSTASH_CURRENT_SIGNING_KEY", ""), os.getenv("QSTASH_NEXT_SIGNING_KEY", "")))
+    queue_enabled = bool(
+        QSTASH_TOKEN and QSTASH_WORKER_URL and QSTASH_FAILURE_CALLBACK_URL
+        and os.getenv("QSTASH_CURRENT_SIGNING_KEY") and os.getenv("QSTASH_NEXT_SIGNING_KEY")
+    )
+    if qstash_requested and not queue_enabled:
+        raise HTTPException(503, "QStash configuration is incomplete")
+    if queue_enabled or not wait:
+        if not queue_enabled:
+            raise HTTPException(503, "Async jobs require QSTASH_TOKEN and QSTASH_WORKER_URL")
+        try:
+            await asyncio.to_thread(jobs.create_job, request_id, filename, document_type, locale, content)
+            await asyncio.to_thread(_enqueue_job, request_id)
+        except Exception as exc:
+            await asyncio.to_thread(jobs.delete_job, request_id)
+            logger.exception("Could not enqueue extraction job job_id=%s", request_id)
+            raise HTTPException(503, "No se pudo encolar el documento. Reintenta la solicitud.") from exc
+        if wait and JOB_WAIT_SECONDS:
+            deadline = time.monotonic() + JOB_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                job = await asyncio.to_thread(jobs.get_job, request_id)
+                if job and job["status"] in {"completed", "failed"}:
+                    return _job_response(job)
+                await asyncio.sleep(0.4)
+        return JSONResponse(status_code=202, content=_job_response(await asyncio.to_thread(jobs.get_job, request_id)).model_dump(mode="json"))
+
+    return await _process_extraction(request_id, filename, content, document_type, locale)
+
+
+def _enqueue_job(job_id: str) -> None:
+    from qstash import QStash
+
+    client = QStash(QSTASH_TOKEN, base_url=os.getenv("QSTASH_URL") or None)
+    client.message.enqueue_json(
+        queue=QSTASH_QUEUE_NAME,
+        url=QSTASH_WORKER_URL,
+        body={"job_id": job_id},
+        retries=int(os.getenv("QSTASH_RETRIES", "3")),
+        timeout=os.getenv("QSTASH_DELIVERY_TIMEOUT", "300s"),
+        failure_callback=QSTASH_FAILURE_CALLBACK_URL,
+    )
+
+
+def _job_response(job: dict[str, Any]) -> ExtractionJobResponse:
+    return ExtractionJobResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        status_url=f"/v1/extractions/{job['job_id']}",
+        result=ExtractionResponse.model_validate(job["result"]) if job.get("result") else None,
+        error=job.get("error"),
+    )
+
+
+@app.get("/v1/extractions/{job_id}", response_model=ExtractionJobResponse)
+async def get_extraction_job(job_id: str, _: None = Depends(require_bearer)) -> ExtractionJobResponse:
+    job = await asyncio.to_thread(jobs.get_job, job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return _job_response(job)
+
+
+async def _verify_qstash(request: Request, body: bytes) -> None:
+    current = os.getenv("QSTASH_CURRENT_SIGNING_KEY", "")
+    next_key = os.getenv("QSTASH_NEXT_SIGNING_KEY", "")
+    signature = request.headers.get("Upstash-Signature", "")
+    if not current or not next_key or not signature or not QSTASH_WORKER_URL:
+        raise HTTPException(503, "QStash signature verification is not configured")
+    try:
+        from qstash import Receiver
+
+        receiver = Receiver(current_signing_key=current, next_signing_key=next_key)
+        valid = await asyncio.to_thread(
+            receiver.verify, body=body.decode("utf-8"), signature=signature,
+            url=QSTASH_WORKER_URL,
+        )
+    except Exception as exc:
+        logger.warning("QStash signature verification failed error=%s", type(exc).__name__)
+        valid = False
+    if not valid:
+        raise HTTPException(401, "Invalid QStash signature")
+
+
+@app.post("/internal/qstash/extractions", include_in_schema=False)
+async def process_queued_extraction(request: Request) -> dict[str, str]:
+    body = await request.body()
+    await _verify_qstash(request, body)
+    try:
+        message = json.loads(body)
+        job_id = str(uuid.UUID(message["job_id"]))
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Invalid job message") from exc
+    job = await asyncio.to_thread(jobs.get_job, job_id, include_content=True)
+    if job is None:
+        return {"status": "missing"}
+    if job["status"] == "completed":
+        return {"status": "completed"}
+    await asyncio.to_thread(jobs.set_job_status, job_id, "processing")
+    try:
+        response = await _process_extraction(
+            job_id, job["filename"], job["content"], job["document_type"], job["locale"]
+        )
+        await asyncio.to_thread(
+            jobs.set_job_status, job_id, "completed", result=response.model_dump(mode="json")
+        )
+        await asyncio.to_thread(jobs.discard_job_content, job_id)
+    except HTTPException as exc:
+        if exc.status_code < 500:
+            await asyncio.to_thread(jobs.set_job_status, job_id, "failed", error=str(exc.detail))
+            await asyncio.to_thread(jobs.discard_job_content, job_id)
+            return {"status": "failed"}
+        # A non-2xx response tells QStash to retry transient processing failures.
+        await asyncio.to_thread(jobs.set_job_status, job_id, "queued", error=str(exc.detail))
+        raise
+    except Exception as exc:
+        await asyncio.to_thread(jobs.set_job_status, job_id, "queued", error="Processing failed")
+        logger.exception("Queued extraction failed job_id=%s", job_id)
+        raise HTTPException(503, "Processing failed; QStash will retry") from exc
+    return {"status": "completed"}
+
+
+@app.post("/internal/qstash/failures", include_in_schema=False)
+async def qstash_failure_callback(request: Request) -> dict[str, str]:
+    body = await request.body()
+    current = os.getenv("QSTASH_CURRENT_SIGNING_KEY", "")
+    next_key = os.getenv("QSTASH_NEXT_SIGNING_KEY", "")
+    signature = request.headers.get("Upstash-Signature", "")
+    if not current or not next_key or not signature or not QSTASH_FAILURE_CALLBACK_URL:
+        raise HTTPException(503, "QStash signature verification is not configured")
+    try:
+        from qstash import Receiver
+
+        receiver = Receiver(current_signing_key=current, next_signing_key=next_key)
+        valid = await asyncio.to_thread(
+            receiver.verify, body=body.decode("utf-8"), signature=signature,
+            url=QSTASH_FAILURE_CALLBACK_URL,
+        )
+        callback = json.loads(body)
+        source = json.loads(base64.b64decode(callback["sourceBody"], validate=True))
+        job_id = str(uuid.UUID(source["job_id"]))
+    except Exception as exc:
+        logger.warning("Invalid QStash failure callback error=%s", type(exc).__name__)
+        raise HTTPException(401, "Invalid QStash failure callback") from exc
+    if not valid:
+        raise HTTPException(401, "Invalid QStash failure callback signature")
+    job = await asyncio.to_thread(jobs.get_job, job_id)
+    if job and job["status"] != "completed":
+        await asyncio.to_thread(jobs.set_job_status, job_id, "failed", error="QStash exhausted delivery retries")
+        await asyncio.to_thread(jobs.discard_job_content, job_id)
+    return {"status": "recorded"}
+
+
+async def _process_extraction(
+    request_id: str, filename: str, content: bytes, document_type: str, locale: str
+) -> ExtractionResponse:
     async with extraction_slot():
         started = asyncio.get_running_loop().time()
         raw_text, page_count, ocr_pages, ocr_failures = await asyncio.to_thread(_extract_pdf_text, content)
@@ -222,9 +397,6 @@ async def extract_document(
             warnings.append(f"OCR falló en {ocr_failures} página(s); revisar la extracción.")
         if len(raw_text) > int(os.getenv("MAX_PROVIDER_TEXT_CHARS", "100000")):
             warnings.append("El proveedor recibió solo una parte del texto por el límite de contexto; raw_text contiene el texto completo extraído.")
-        result: dict[str, Any] = {}
-        provider_name: str | None = None
-        provider_model: str | None = None
         try:
             result, provider_name, provider_model = await asyncio.wait_for(
                 extract_with_provider(raw_text, document_type=document_type, locale=locale),

@@ -12,7 +12,29 @@ El script prepara `.venv`, instala las dependencias si faltan y arranca Uvicorn 
 
 El endpoint primero extrae texto embebido y aplica OCR local a páginas con imágenes o sin texto suficiente. Gemini es el proveedor principal. Si falla, devuelve error, excede su timeout o responde sin clasificar el documento, la solicitud actual pasa a OpenAI y se abre un circuito de 30 minutos: durante ese periodo las solicitudes siguientes van directo a OpenAI. Al vencer el periodo, se vuelve a probar Gemini; si funciona, queda como proveedor principal. El estado se guarda en `/var/lib/api-pdf/gemini-circuit.json` en la VM para sobrevivir reinicios y actualizaciones del contenedor. Si falla el fallback de OpenAI o no está configurado, la API responde `503` con `Retry-After: 10` y un mensaje `No se pudo procesar`; nunca devuelve `document_type: unknown`. Configura `OPENAI_API_KEY` para habilitar el fallback. El texto extraído completo se devuelve en `raw_text` cuando un proveedor logra clasificar el documento.
 
-Endpoint: `POST /v1/extractions`, multipart con `file` y campos `document_type` (`auto`, `invoice`, `quote`, `transport_document`) y `locale` (`es-CL`). Para facturas se buscan número, RUT de cliente/proveedor, fecha y monto; si no se leen, se devuelven como `null` cuando el proveedor estructure el documento y se agregan advertencias. Esos campos no se exigen para otros documentos.
+Endpoint: `POST /v1/extractions`, multipart con `file`, `document_type` (`auto`, `invoice`, `quote`, `transport_document`), `locale` (`es-CL`) y `wait` (`true` o `false`). `wait` por defecto es `true`. Para facturas se buscan número, RUT de cliente/proveedor, fecha y monto; si no se leen, se devuelven como `null` cuando el proveedor estructure el documento y se agregan advertencias. Esos campos no se exigen para otros documentos.
+
+### Jobs en cola con QStash
+
+Con `QSTASH_TOKEN`, claves de firma y `QSTASH_WORKER_URL` configurados, todas las solicitudes se encolan en QStash. `wait=true` (por defecto) conserva la experiencia de esperar la extracción: devuelve el resultado si termina dentro de `JOB_WAIT_SECONDS`; si sigue procesando, responde `202` con el ID y la URL de consulta. `wait=false` devuelve ese `202` inmediatamente. Sin QStash configurado, `wait=true` mantiene el procesamiento síncrono anterior y `wait=false` responde `503`.
+
+QStash debe poder acceder públicamente a `QSTASH_WORKER_URL`, que debe ser la URL HTTPS completa de `POST /internal/qstash/extractions`. La API verifica `Upstash-Signature` con ambas claves de firma rotables. El callback de fallos usa `QSTASH_FAILURE_CALLBACK_URL` (si se omite, se deriva como `/internal/qstash/failures`). Crea una cola llamada igual a `QSTASH_QUEUE_NAME` en QStash y configura su paralelismo igual a `QSTASH_PARALLELISM`. El estado y el PDF pendiente quedan en SQLite bajo `/var/lib/api-pdf/jobs.sqlite3`, dentro del volumen persistente; el PDF se elimina de la fila al completar el job. Los resultados se conservan por `JOB_RETENTION_DAYS` (7 días por defecto). Protege el volumen.
+
+Configura `QSTASH_URL`, `QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY` y `QSTASH_WORKER_URL` en `.env`. `QSTASH_URL` es la URL regional de Upstash que muestra la consola (por ejemplo, `https://qstash-us-east-1.upstash.io`); la URL del worker debe apuntar a tu API pública. Para encolar y consultar:
+
+```sh
+curl --request POST 'https://pdf.solidtec.cl/v1/extractions' \
+  --header "Authorization: Bearer $API_BEARER_TOKEN" \
+  --form 'file=@./documento.pdf;type=application/pdf' \
+  --form 'document_type=auto' \
+  --form 'locale=es-CL' \
+  --form 'wait=false'
+
+curl 'https://pdf.solidtec.cl/v1/extractions/JOB_ID' \
+  --header "Authorization: Bearer $API_BEARER_TOKEN"
+```
+
+La respuesta `202` incluye `job_id`, `status_url` y `status` (`queued`, `processing`, `completed` o `failed`). Consulta `GET /v1/extractions/{job_id}` con el mismo bearer hasta que el estado sea `completed` o `failed`; al terminar incluye `result` con el mismo esquema de la respuesta síncrona. Con `wait=true`, la API hace esta espera por hasta 25 segundos por defecto y puede devolver `202` si el job sigue en curso. Con `wait=false`, devuelve `202` inmediatamente. La cola QStash es durable y reintenta entregas; SQLite mantiene estado/resultados y requiere que el volumen persistente esté montado. Para varias réplicas o tolerancia a pérdida de VM, mueve el almacenamiento de jobs a una base administrada compartida.
 
 ## Integración con n8n
 
@@ -30,8 +52,11 @@ Usa el nodo **HTTP Request** para enviar cada PDF y recibir una respuesta JSON. 
    - Agrega `file` como tipo **n8n Binary File**; en **Input Data Field Name** indica la propiedad binaria, por ejemplo `data`.
    - Agrega `document_type` como **Form Data**, valor `auto` para clasificar cualquier PDF automáticamente. También puedes indicar `invoice`, `quote` o `transport_document` cuando ya conozcas el tipo.
    - Agrega `locale` como **Form Data**, valor `es-CL`.
+   - Agrega `wait` como **Form Data**. Usa `true` para esperar hasta 25 segundos; usa `false` para iniciar el job y pasar de inmediato al polling.
    - Deja que n8n genere el encabezado `Content-Type` de multipart; no lo fijes manualmente, porque debe incluir el límite (boundary) del formulario.
-   - Configura el formato de respuesta como JSON/Autodetect y un timeout de hasta `300000` ms para documentos lentos o con muchas páginas.
+   - Configura el formato de respuesta como JSON/Autodetect. Trata tanto HTTP `200` como `202` como respuestas válidas.
+
+Para el flujo asíncrono, envía `wait=false`. Después del POST, agrega un nodo **HTTP Request** GET a `https://pdf.solidtec.cl{{$json.status_url}}` usando la misma credencial Bearer. Revisa `status`: si es `queued` o `processing`, espera unos segundos y vuelve a consultar; si es `completed`, usa `result`; si es `failed`, deriva el job a manejo de errores. Si activas **Include Response Headers and Status**, n8n puede anidar el JSON bajo `body`; ajusta las expresiones (`$json.status_url`, `$json.status`, `$json.result`) a esa salida.
 
 El nodo requiere que el campo del archivo se llame exactamente `file`. No envíes el PDF como JSON ni como texto base64. Consulta la documentación del [nodo HTTP Request de n8n](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.httprequest/) para los nombres de opciones de tu versión.
 
@@ -43,8 +68,11 @@ curl --request POST 'https://pdf.solidtec.cl/v1/extractions' \
   --header "Authorization: Bearer $API_BEARER_TOKEN" \
   --form 'file=@./documento.pdf;type=application/pdf' \
   --form 'document_type=auto' \
-  --form 'locale=es-CL'
+  --form 'locale=es-CL' \
+  --form 'wait=true'
 ```
+
+Con QStash habilitado, `wait=true` puede responder `202` si el job aún no termina después del tiempo de espera; en ese caso consulta el `status_url` como en el ejemplo anterior.
 
 ### Respuesta y uso de los datos
 
