@@ -134,7 +134,9 @@ En la VM cada solicitud completada agrega una línea JSON a `/var/lib/api-pdf/me
 sudo tail -n 20 /var/lib/api-pdf/metrics.jsonl
 ```
 
-Límites configurables: `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_CONCURRENT_EXTRACTIONS`, `OCR_LANG`, `OCR_TIMEOUT_SECONDS`, `OCR_TOTAL_TIMEOUT_SECONDS`, `PROVIDER_TIMEOUT_SECONDS` y `MAX_PROVIDER_TEXT_CHARS`. Para OCR en español e inglés, la imagen base instala los paquetes Tesseract correspondientes.
+Si se alcanzan todas las plazas definidas por `MAX_CONCURRENT_EXTRACTIONS`, la API espera hasta `EXTRACTION_QUEUE_TIMEOUT_SECONDS` (30 segundos por defecto). Si no queda una plaza libre, responde `503 Service Unavailable`, con el mensaje `API ocupada procesando otros documentos; reintente en unos segundos.` y la cabecera `Retry-After: 10`. Configura el nodo HTTP Request de n8n para reintentar errores 503 después de una espera; el flujo de importación incluido procesa un PDF a la vez.
+
+Límites configurables: `MAX_UPLOAD_MB`, `MAX_PDF_PAGES`, `MAX_CONCURRENT_EXTRACTIONS`, `EXTRACTION_QUEUE_TIMEOUT_SECONDS`, `OCR_LANG`, `OCR_TIMEOUT_SECONDS`, `OCR_TOTAL_TIMEOUT_SECONDS`, `PROVIDER_TIMEOUT_SECONDS` y `MAX_PROVIDER_TEXT_CHARS`. Para OCR en español e inglés, la imagen base instala los paquetes Tesseract correspondientes.
 
 ## Despliegue automático en VM
 

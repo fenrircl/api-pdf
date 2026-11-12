@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
@@ -29,9 +30,29 @@ OCR_MIN_CHARS_PER_PAGE = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "25"))
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "45"))
 OCR_TOTAL_TIMEOUT_SECONDS = int(os.getenv("OCR_TOTAL_TIMEOUT_SECONDS", "180"))
 PROVIDER_TIMEOUT_SECONDS = int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
+EXTRACTION_QUEUE_TIMEOUT_SECONDS = max(0.1, float(os.getenv("EXTRACTION_QUEUE_TIMEOUT_SECONDS", "30")))
 API_METRICS_FILE = os.getenv("API_METRICS_FILE", "/tmp/api-pdf-metrics.jsonl")
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2"))))
 METRICS_LOCK = threading.Lock()
+
+
+@asynccontextmanager
+async def extraction_slot():
+    """Wait briefly for capacity; report an explicit retryable busy response if full."""
+    try:
+        await asyncio.wait_for(
+            EXTRACTION_SEMAPHORE.acquire(), timeout=EXTRACTION_QUEUE_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="API ocupada procesando otros documentos; reintente en unos segundos.",
+            headers={"Retry-After": "10"},
+        ) from exc
+    try:
+        yield
+    finally:
+        EXTRACTION_SEMAPHORE.release()
 
 
 class ExtractionResponse(BaseModel):
@@ -158,7 +179,7 @@ async def extract_document(
         raise HTTPException(415, "File must have a .pdf extension")
     if file.content_type not in (None, "", "application/pdf", "application/octet-stream"):
         raise HTTPException(415, "Content-Type must be application/pdf")
-    async with EXTRACTION_SEMAPHORE:
+    async with extraction_slot():
         started = asyncio.get_running_loop().time()
         raw_text, page_count, ocr_pages, ocr_failures = await asyncio.to_thread(_extract_pdf_text, content)
         warnings: list[str] = []
