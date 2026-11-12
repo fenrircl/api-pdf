@@ -14,7 +14,7 @@ from typing import Any
 
 EXTRACTION_PROMPT = """Eres un extractor de documentos. Usa solamente la evidencia del texto; no inventes valores. Devuelve SOLO JSON válido con esta forma:
 {{"document_type":"invoice|quote|transport_document|other|unknown","document_subtype":null,"data":{{}},"confidence":0.0,"warnings":[]}}
-Para facturas, data debe incluir invoice_number, customer_rut, supplier_rut, date (YYYY-MM-DD), amount (número), currency, net_amount, tax_amount, issuer, recipient y line_items. Usa null si un campo no aparece o no es legible. En otros documentos extrae los campos relevantes encontrados en data, sin imponer campos de factura. Conserva números y moneda con fidelidad. Idioma/localidad solicitada: {locale}. Tipo solicitado: {document_type}.
+Para facturas, data debe incluir invoice_number, customer_rut, supplier_rut, date (YYYY-MM-DD), amount (total final), currency, net_amount, tax_amount, issuer, recipient y line_items. Si el total final no es legible pero el monto neto y el IVA sí lo son, calcula amount = net_amount + tax_amount solo cuando no haya montos exentos, descuentos no nulos, impuestos adicionales ni otros cargos que alteren la suma; agrega una advertencia indicando que el total fue calculado y requiere revisión. Si la suma no es segura, usa null. Usa null para cualquier otro campo que no aparezca o no sea legible. En otros documentos extrae los campos relevantes encontrados en data, sin imponer campos de factura. Conserva números y moneda con fidelidad. Idioma/localidad solicitada: {locale}. Tipo solicitado: {document_type}.
 Texto del PDF:
 {text}
 """

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -114,6 +115,38 @@ def _record_metrics(response: ExtractionResponse) -> None:
         )
 
 
+def _infer_invoice_total(data: dict[str, Any], raw_text: str) -> bool:
+    """Infer a missing total only when OCR explicitly supports net + VAT arithmetic."""
+    if data.get("amount") not in (None, ""):
+        return False
+
+    net = data.get("net_amount")
+    tax = data.get("tax_amount")
+    if isinstance(net, bool) or isinstance(tax, bool):
+        return False
+    if not isinstance(net, (int, float)) or not isinstance(tax, (int, float)):
+        return False
+    if not math.isfinite(net) or not math.isfinite(tax) or net < 0 or tax < 0:
+        return False
+
+    text = raw_text.upper()
+    if not re.search(r"\b(?:MONTO\s+NETO|NETO)\b", text) or not re.search(r"\bIVA\b", text):
+        return False
+    if re.search(r"\bEXENTO\b|IMPUESTO\s+ADICIONAL", text):
+        return False
+
+    for key in ("discount_amount", "exempt_amount", "additional_tax_amount", "other_charges"):
+        value = data.get(key)
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)) and (not math.isfinite(value) or value != 0):
+            return False
+
+    total = net + tax
+    data["amount"] = int(total) if float(total).is_integer() else total
+    return True
+
+
 def _extract_pdf_text(content: bytes) -> tuple[str, int, int, int]:
     """Read embedded text and OCR pages without enough selectable text."""
     try:
@@ -215,6 +248,8 @@ async def extract_document(
         )
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     if kind == "invoice":
+        if _infer_invoice_total(data, raw_text):
+            warnings.append("El total no se distinguió en el OCR; se calculó como monto neto + IVA y requiere revisión.")
         required = {
             "invoice_number": "número de factura",
             "customer_rut": "RUT del cliente",
