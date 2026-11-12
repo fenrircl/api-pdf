@@ -318,14 +318,12 @@ async def _verify_qstash(request: Request, body: bytes) -> None:
         from qstash import Receiver
 
         receiver = Receiver(current_signing_key=current, next_signing_key=next_key)
-        valid = await asyncio.to_thread(
+        await asyncio.to_thread(
             receiver.verify, body=body.decode("utf-8"), signature=signature,
             url=QSTASH_WORKER_URL,
         )
     except Exception as exc:
         logger.warning("QStash signature verification failed error=%s", type(exc).__name__)
-        valid = False
-    if not valid:
         raise HTTPException(401, "Invalid QStash signature")
 
 
@@ -380,7 +378,7 @@ async def qstash_failure_callback(request: Request) -> dict[str, str]:
         from qstash import Receiver
 
         receiver = Receiver(current_signing_key=current, next_signing_key=next_key)
-        valid = await asyncio.to_thread(
+        await asyncio.to_thread(
             receiver.verify, body=body.decode("utf-8"), signature=signature,
             url=QSTASH_FAILURE_CALLBACK_URL,
         )
@@ -390,8 +388,6 @@ async def qstash_failure_callback(request: Request) -> dict[str, str]:
     except Exception as exc:
         logger.warning("Invalid QStash failure callback error=%s", type(exc).__name__)
         raise HTTPException(401, "Invalid QStash failure callback") from exc
-    if not valid:
-        raise HTTPException(401, "Invalid QStash failure callback signature")
     job = await asyncio.to_thread(jobs.get_job, job_id)
     if job and job["status"] != "completed":
         await asyncio.to_thread(jobs.set_job_status, job_id, "failed", error="QStash exhausted delivery retries")
