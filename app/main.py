@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import fitz
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -357,6 +358,10 @@ async def process_queued_extraction(request: Request) -> dict[str, str]:
             await asyncio.to_thread(jobs.discard_job_content, job_id)
             return {"status": "failed"}
         # A non-2xx response tells QStash to retry transient processing failures.
+        logger.warning(
+            "qstash_job_retry job_id=%s http_status=%s detail=%s",
+            job_id, exc.status_code, str(exc.detail)[:500],
+        )
         await asyncio.to_thread(jobs.set_job_status, job_id, "queued", error=str(exc.detail))
         raise
     except Exception as exc:
@@ -390,7 +395,26 @@ async def qstash_failure_callback(request: Request) -> dict[str, str]:
         raise HTTPException(401, "Invalid QStash failure callback") from exc
     job = await asyncio.to_thread(jobs.get_job, job_id)
     if job and job["status"] != "completed":
-        await asyncio.to_thread(jobs.set_job_status, job_id, "failed", error="QStash exhausted delivery retries")
+        response_body = ""
+        try:
+            encoded_body = callback.get("body")
+            if isinstance(encoded_body, str) and encoded_body:
+                response_body = base64.b64decode(encoded_body, validate=True).decode("utf-8", errors="replace")
+        except (ValueError, UnicodeDecodeError):
+            response_body = ""
+        response_body = " ".join(response_body.split())[:500]
+        destination = urlsplit(str(callback.get("url") or "")).path or "worker"
+        attempts = callback.get("retried", "?")
+        max_attempts = callback.get("maxRetries", "?")
+        http_status = callback.get("status", "?")
+        error = (
+            f"QStash agotó los reintentos ({attempts}/{max_attempts}); "
+            f"última respuesta HTTP {http_status} de {destination}"
+        )
+        if response_body:
+            error += f": {response_body}"
+        logger.error("qstash_job_exhausted job_id=%s error=%s", job_id, error)
+        await asyncio.to_thread(jobs.set_job_status, job_id, "failed", error=error)
         await asyncio.to_thread(jobs.discard_job_content, job_id)
     return {"status": "recorded"}
 
