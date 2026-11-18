@@ -308,6 +308,17 @@ def _should_try_next_model(exc: Exception) -> bool:
     return True
 
 
+def _provider_error_label(exc: Exception) -> str:
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if code is None:
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", None)
+    label = type(exc).__name__
+    if isinstance(code, (int, str)) and str(code).strip():
+        label += f"(code={str(code)[:32]})"
+    return label
+
+
 async def extract_with_provider(
     text: str, *, document_type: str, locale: str
 ) -> tuple[dict[str, Any], str | None, str | None]:
@@ -321,8 +332,6 @@ async def extract_with_provider(
     errors: list[str] = []
     first_result: dict[str, Any] | None = None
     first_model: str | None = None
-    loop = asyncio.get_running_loop()
-    provider_started = loop.time()
     provider_timeout = max(1.0, float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60")))
 
     if os.getenv("GEMINI_API_KEY"):
@@ -351,23 +360,25 @@ async def extract_with_provider(
                     _close_gemini_circuit()
                     return result, "gemini", model
                 except Exception as exc:
-                    errors.append(f"gemini:{type(exc).__name__}")
+                    failure = _provider_error_label(exc)
+                    errors.append(f"gemini:{model}:{failure}")
+                    logger.warning("Gemini extraction failed model=%s error=%s", model, failure)
                     if _is_daily_quota_error(exc):
                         _cool_down_model_for_daily_quota(model)
                     _open_gemini_circuit(type(exc).__name__)
 
     if os.getenv("OPENAI_API_KEY"):
-        remaining = provider_timeout - (loop.time() - provider_started) - 0.5
-        if remaining > 0:
-            try:
-                result, model = await asyncio.wait_for(_openai_extract(prompt), timeout=remaining)
-                if not _has_supported_document_type(result):
-                    raise RuntimeError("OpenAI returned an unclassified document")
-                return result, "openai", model
-            except Exception as exc:
-                errors.append(f"openai:{type(exc).__name__}")
-        else:
-            errors.append("openai:no_time_remaining")
+        try:
+            # Gemini gets its own short attempt. Do not consume OpenAI's timeout
+            # budget with that attempt: fallback must get a full provider window.
+            result, model = await asyncio.wait_for(_openai_extract(prompt), timeout=provider_timeout)
+            if not _has_supported_document_type(result):
+                raise RuntimeError("OpenAI returned an unclassified document")
+            return result, "openai", model
+        except Exception as exc:
+            failure = _provider_error_label(exc)
+            errors.append(f"openai:{os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')}:{failure}")
+            logger.warning("OpenAI extraction failed model=%s error=%s", os.getenv("OPENAI_MODEL", "gpt-4.1-mini"), failure)
 
     if first_result is not None:
         return first_result, "gemini", first_model

@@ -35,6 +35,9 @@ OCR_MIN_CHARS_PER_PAGE = int(os.getenv("OCR_MIN_CHARS_PER_PAGE", "25"))
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "45"))
 OCR_TOTAL_TIMEOUT_SECONDS = int(os.getenv("OCR_TOTAL_TIMEOUT_SECONDS", "180"))
 PROVIDER_TIMEOUT_SECONDS = int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "60"))
+PROVIDER_CHAIN_TIMEOUT_SECONDS = max(
+    1.0, PROVIDER_TIMEOUT_SECONDS + float(os.getenv("GEMINI_ATTEMPT_TIMEOUT_SECONDS", "30")) + 5
+)
 EXTRACTION_QUEUE_TIMEOUT_SECONDS = max(0.1, float(os.getenv("EXTRACTION_QUEUE_TIMEOUT_SECONDS", "30")))
 API_METRICS_FILE = os.getenv("API_METRICS_FILE", "/tmp/api-pdf-metrics.jsonl")
 EXTRACTION_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2"))))
@@ -435,13 +438,18 @@ async def _process_extraction(
         try:
             result, provider_name, provider_model = await asyncio.wait_for(
                 extract_with_provider(raw_text, document_type=document_type, locale=locale),
-                timeout=PROVIDER_TIMEOUT_SECONDS,
+                timeout=PROVIDER_CHAIN_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            logger.warning("Provider extraction failed request_id=%s error=%s", request_id, type(exc).__name__)
+            if isinstance(exc, RuntimeError) and str(exc).startswith("No provider could classify"):
+                failure_summary = str(exc)[:350]
+            else:
+                failure_summary = type(exc).__name__
+            logger.warning("Provider extraction failed request_id=%s error=%s", request_id, failure_summary)
             raise HTTPException(
                 status_code=503,
-                detail="No se pudo procesar el documento con los modelos disponibles. Reintenta la solicitud.",
+                detail="No se pudo procesar el documento con los modelos disponibles. Reintenta la solicitud. "
+                f"Detalle: {failure_summary}",
                 headers={"Retry-After": "10"},
             ) from exc
 
